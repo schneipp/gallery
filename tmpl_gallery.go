@@ -977,7 +977,7 @@ const galleryHTML = `<!DOCTYPE html>
     <div class="gallery-{{.Config.Layout}} hover-{{.Config.HoverEffect}} frame-{{.Config.FrameStyle}}" id="gallery">
       {{range $i, $p := .Photos}}
       <div class="photo-card" data-index="{{$i}}" style="animation-delay: {{delay $i}}s" onclick="openLightbox({{$i}})">
-        <img data-src="/proxy/image?url={{$p.MediumURL}}" alt="{{$p.DisplayName}}" loading="lazy">
+        <img data-src="/proxy/image?url={{urlencode $p.MediumURL}}" alt="{{$p.DisplayName}}" loading="lazy">
         <div class="photo-overlay">
           <span class="photo-name">{{if $.Config.ShowFilenames}}{{$p.DisplayName}}{{end}}</span>
           {{if $p.Rating}}<span class="photo-rating">{{stars $p.Rating}}</span>{{end}}
@@ -1025,7 +1025,7 @@ const galleryHTML = `<!DOCTYPE html>
   // Lightbox
   const photos = [
     {{range .Photos}}
-    {name: "{{.DisplayName}}", url: "/proxy/image?url={{.MediumURL}}", rating: {{.Rating}}},
+    {name: "{{.DisplayName}}", url: "/proxy/image?url={{urlencode .MediumURL}}", rating: {{.Rating}}},
     {{end}}
   ];
   let currentIndex = 0;

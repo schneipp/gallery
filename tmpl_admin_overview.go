@@ -205,6 +205,20 @@ const adminOverviewHTML = `<!DOCTYPE html>
           <input type="text" name="card_color" value="{{.Site.CardColor}}">
         </div>
       </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Nextcloud URL</label>
+          <input type="text" name="nextcloud_url" value="{{.Site.NextcloudURL}}" placeholder="https://cloud.example.com">
+        </div>
+        <div class="field">
+          <label>Nextcloud Username</label>
+          <input type="text" name="nextcloud_user" value="{{.Site.NextcloudUser}}" placeholder="username">
+        </div>
+      </div>
+      <div class="field" style="max-width:50%">
+        <label>Nextcloud App Token</label>
+        <input type="password" name="nextcloud_token" placeholder="{{if .Site.NextcloudToken}}••••••••  (saved, leave empty to keep){{else}}App-specific password{{end}}">
+      </div>
       <button type="submit" class="btn btn-primary btn-sm" style="margin-top:8px">Save Site Settings</button>
     </form>
   </div>
@@ -212,19 +226,140 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <!-- Add Gallery -->
   <div class="section">
     <div class="section-title">Add Gallery</div>
-    <form method="POST" action="/admin/new">
-      <div class="add-form">
-        <div class="field">
-          <label>Capture One Live URL</label>
-          <input type="text" name="capture_one_url" placeholder="https://live.captureone.com/your-gallery-id" required>
-        </div>
-        <button type="submit" class="btn btn-primary">Add &amp; Sync</button>
+    <form method="POST" action="/admin/new" id="newGalleryForm">
+      <div class="field">
+        <label>Source Type</label>
+        <select name="source_type" id="newSourceType" onchange="toggleNewSourceFields()" style="width:auto;min-width:200px">
+          <option value="captureone" selected>Capture One Live</option>
+          <option value="nextcloud">Nextcloud</option>
+        </select>
       </div>
+
+      <!-- Capture One Fields -->
+      <div id="new-captureone-fields">
+        <div class="add-form">
+          <div class="field">
+            <label>Capture One Live URL</label>
+            <input type="text" name="capture_one_url" placeholder="https://live.captureone.com/your-gallery-id">
+          </div>
+          <button type="submit" class="btn btn-primary">Add &amp; Sync</button>
+        </div>
+      </div>
+
+      <!-- Nextcloud Fields -->
+      <div id="new-nextcloud-fields" style="display:none">
+        {{if .Site.NextcloudURL}}
+        <input type="hidden" name="nextcloud_folder" id="nc_selected_folder" value="">
+        <div class="field">
+          <label>Select Folder from Nextcloud</label>
+          <div id="nc-folder-browser" style="background:#111;border:1px solid #333;border-radius:8px;padding:12px;max-height:300px;overflow-y:auto">
+            <div id="nc-breadcrumb" style="font-size:12px;color:#888;margin-bottom:8px;display:flex;gap:4px;flex-wrap:wrap"></div>
+            <div id="nc-folder-list" style="color:#999;font-size:13px">Click "Load Folders" to browse...</div>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" style="margin-top:8px" onclick="loadNCFolders('')">Load Folders</button>
+        </div>
+        <div id="nc-selected-display" style="margin-top:8px;display:none">
+          <span style="font-size:13px;color:#c8a97e">Selected: </span>
+          <span id="nc-selected-name" style="font-size:13px;color:#fff;font-family:monospace"></span>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:16px" id="nc-submit-btn" disabled>Add &amp; Sync</button>
+        {{else}}
+        <p style="color:#e57373;font-size:14px">Configure Nextcloud credentials in Site Settings above first.</p>
+        {{end}}
+      </div>
+
       <div class="checkbox-field">
         <input type="checkbox" name="is_private" id="new_private">
         <label for="new_private">Private gallery (accessible only via secret link)</label>
       </div>
     </form>
+    <script>
+      function toggleNewSourceFields() {
+        const sourceType = document.getElementById('newSourceType').value;
+        document.getElementById('new-captureone-fields').style.display = sourceType === 'captureone' ? 'block' : 'none';
+        document.getElementById('new-nextcloud-fields').style.display = sourceType === 'nextcloud' ? 'block' : 'none';
+
+        const c1Input = document.querySelector('[name="capture_one_url"]');
+        if (sourceType === 'captureone') {
+          c1Input.setAttribute('required', 'required');
+        } else {
+          c1Input.removeAttribute('required');
+        }
+      }
+      toggleNewSourceFields();
+
+      function loadNCFolders(path) {
+        const list = document.getElementById('nc-folder-list');
+        const breadcrumb = document.getElementById('nc-breadcrumb');
+        list.innerHTML = '<span style="color:#888">Loading...</span>';
+
+        fetch('/admin/nextcloud/folders?path=' + encodeURIComponent(path))
+          .then(r => r.json())
+          .then(data => {
+            if (data.error) {
+              list.innerHTML = '<span style="color:#e57373">' + data.error + '</span>';
+              return;
+            }
+
+            // Build breadcrumb
+            breadcrumb.innerHTML = '';
+            const parts = path ? path.split('/') : [];
+            const rootLink = document.createElement('a');
+            rootLink.textContent = '🏠 Root';
+            rootLink.style.cssText = 'color:#c8a97e;cursor:pointer;text-decoration:none';
+            rootLink.onclick = () => loadNCFolders('');
+            breadcrumb.appendChild(rootLink);
+            let cumPath = '';
+            parts.forEach((p, i) => {
+              const sep = document.createElement('span');
+              sep.textContent = ' / ';
+              sep.style.color = '#555';
+              breadcrumb.appendChild(sep);
+              cumPath += (i > 0 ? '/' : '') + p;
+              const link = document.createElement('a');
+              link.textContent = p;
+              link.style.cssText = 'color:#c8a97e;cursor:pointer;text-decoration:none';
+              const linkPath = cumPath;
+              link.onclick = () => loadNCFolders(linkPath);
+              breadcrumb.appendChild(link);
+            });
+
+            list.innerHTML = '';
+            if (!data.folders || data.folders.length === 0) {
+              list.innerHTML = '<span style="color:#666">No subfolders</span>';
+            }
+
+            // "Select this folder" button if we're inside a folder
+            if (path) {
+              const selectBtn = document.createElement('div');
+              selectBtn.style.cssText = 'padding:8px 12px;margin-bottom:4px;background:#1a3a1a;border:1px solid #2a5a2a;border-radius:6px;cursor:pointer;color:#81c784;font-size:13px';
+              selectBtn.textContent = '✓ Use this folder: /' + path;
+              selectBtn.onclick = () => selectNCFolder(path);
+              list.prepend(selectBtn);
+            }
+
+            (data.folders || []).forEach(f => {
+              const item = document.createElement('div');
+              item.style.cssText = 'padding:8px 12px;margin-bottom:2px;border-radius:6px;cursor:pointer;transition:background 0.15s;font-size:13px;color:#e0e0e0';
+              item.textContent = '📁 ' + f.split('/').pop();
+              item.onmouseenter = () => item.style.background = '#222';
+              item.onmouseleave = () => item.style.background = 'transparent';
+              item.onclick = () => loadNCFolders(f);
+              list.appendChild(item);
+            });
+          })
+          .catch(err => {
+            list.innerHTML = '<span style="color:#e57373">Error: ' + err.message + '</span>';
+          });
+      }
+
+      function selectNCFolder(path) {
+        document.getElementById('nc_selected_folder').value = path;
+        document.getElementById('nc-selected-display').style.display = 'block';
+        document.getElementById('nc-selected-name').textContent = '/' + path;
+        document.getElementById('nc-submit-btn').disabled = false;
+      }
+    </script>
   </div>
 
   <!-- Gallery List -->
@@ -234,7 +369,7 @@ const adminOverviewHTML = `<!DOCTYPE html>
     <div class="gallery-grid">
       {{range .Galleries}}
       <a class="gallery-card" href="/admin/gallery/{{.ID}}">
-        <div class="gallery-card-cover" {{if .Photos}}style="background-image: url('/proxy/image?url={{(index .Photos 0).SmallURL}}')"{{end}}>
+        <div class="gallery-card-cover" {{if .Photos}}style="background-image: url('{{proxyURL (index .Photos 0).SmallURL}}')"{{end}}>
           <span class="photo-count">{{len .Photos}} photos</span>
         </div>
         <div class="gallery-card-body">

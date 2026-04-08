@@ -127,26 +127,53 @@ const adminEditHTML = `<!DOCTYPE html>
 
   <!-- Sync Section -->
   <div class="section">
-    <div class="section-title">Capture One Live</div>
+    <div class="section-title">Source</div>
     <form method="POST" action="/admin/gallery/sync">
       <input type="hidden" name="gallery_id" value="{{.ID}}">
-      <div class="sync-section">
-        <div class="field">
+      <div class="field">
+        <label>Source Type</label>
+        <select name="source_type" id="sourceType" onchange="toggleSourceFields()">
+          <option value="captureone" {{if eq .Config.SourceType "captureone"}}selected{{end}}>Capture One Live</option>
+          <option value="nextcloud" {{if eq .Config.SourceType "nextcloud"}}selected{{end}}>Nextcloud</option>
+        </select>
+      </div>
+
+      <!-- Capture One Fields -->
+      <div id="captureone-fields" class="sync-section" style="display:flex;gap:12px;align-items:flex-end">
+        <div class="field" style="flex:1;margin-bottom:0">
           <label>Capture One Live URL</label>
-          <input type="text" name="capture_one_url" value="{{.Config.CaptureOneURL}}" readonly style="opacity:0.7">
+          <input type="text" name="capture_one_url" value="{{.Config.CaptureOneURL}}" placeholder="https://live.captureone.com/...">
         </div>
         <button type="submit" class="btn btn-sync">Re-sync Photos</button>
+      </div>
+
+      <!-- Nextcloud Fields -->
+      <div id="nextcloud-fields" style="display:none">
+        <div class="field">
+          <label>Folder Path</label>
+          <input type="text" name="nextcloud_folder" value="{{.Config.NextcloudFolder}}" placeholder="Photos/Gallery" style="margin-bottom:8px">
+          <span style="font-size:12px;color:#666">Using credentials from Site Settings</span>
+        </div>
+        <button type="submit" class="btn btn-sync" style="margin-top:12px">Re-sync Photos</button>
       </div>
     </form>
     {{if .Photos}}
     <div class="photo-count"><strong>{{len .Photos}}</strong> photos synced</div>
     <div class="preview-grid">
       {{range .Photos}}
-      <div class="preview-thumb" style="background-image: url('/proxy/image?url={{.SmallURL}}')"></div>
+      <div class="preview-thumb" style="background-image: url('{{proxyURL .SmallURL}}')"></div>
       {{end}}
     </div>
     {{end}}
   </div>
+  <script>
+    function toggleSourceFields() {
+      const sourceType = document.getElementById('sourceType').value;
+      document.getElementById('captureone-fields').style.display = sourceType === 'captureone' ? 'flex' : 'none';
+      document.getElementById('nextcloud-fields').style.display = sourceType === 'nextcloud' ? 'block' : 'none';
+    }
+    toggleSourceFields();
+  </script>
 
   <!-- Slideshow -->
   <div class="section">

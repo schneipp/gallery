@@ -1,10 +1,11 @@
 # 📸 Photo Gallery
 
-A self-contained, elegant Go web application designed to showcase photo galleries with seamless integration for Capture One and YouTube audio backgrounds.
+A self-contained, elegant Go web application designed to showcase photo galleries with seamless integration for Capture One, Nextcloud, and YouTube audio backgrounds.
 
 ## ✨ Features
 
 - **Capture One Integration**: Automatically sync galleries by connecting to the Capture One API, fetching photo variants and metadata.
+- **Nextcloud Integration**: Connect your Nextcloud instance to browse folders and create galleries directly from your cloud storage. Credentials are configured globally in the admin panel, and a folder picker lets you select any directory from your Nextcloud.
 - **Audio Integration**: Add atmospheric background music to your galleries by downloading audio from YouTube via `yt-dlp`.
 - **Flexible Access**: 
   - **Public Galleries**: Accessible via a clean, slug-based URL.

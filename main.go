@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	htmltpl "html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,13 +28,18 @@ import (
 // --- Data Model ---
 
 type GalleryConfig struct {
-	CaptureOneURL string `json:"capture_one_url"`
-	GalleryTitle  string `json:"gallery_title"`
-	Subtitle      string `json:"subtitle"`
-	Slug          string `json:"slug"`
-	CoverIndex    int    `json:"cover_index"`
-	IsPrivate     bool   `json:"is_private"`
-	SecretToken   string `json:"secret_token"`
+	SourceType      string `json:"source_type"`
+	CaptureOneURL   string `json:"capture_one_url"`
+	NextcloudURL    string `json:"nextcloud_url"`
+	NextcloudUser   string `json:"nextcloud_user"`
+	NextcloudToken  string `json:"nextcloud_token"`
+	NextcloudFolder string `json:"nextcloud_folder"`
+	GalleryTitle    string `json:"gallery_title"`
+	Subtitle        string `json:"subtitle"`
+	Slug            string `json:"slug"`
+	CoverIndex      int    `json:"cover_index"`
+	IsPrivate       bool   `json:"is_private"`
+	SecretToken     string `json:"secret_token"`
 	// Appearance
 	BackgroundColor string `json:"background_color"`
 	CardColor       string `json:"card_color"`
@@ -94,6 +102,10 @@ type SiteConfig struct {
 	BgColor      string `json:"bg_color"`
 	TextColor    string `json:"text_color"`
 	CardColor    string `json:"card_color"`
+	// Nextcloud credentials (global)
+	NextcloudURL   string `json:"nextcloud_url,omitempty"`
+	NextcloudUser  string `json:"nextcloud_user,omitempty"`
+	NextcloudToken string `json:"nextcloud_token,omitempty"`
 }
 
 type AdminAuth struct {
@@ -131,6 +143,7 @@ func defaultSiteConfig() SiteConfig {
 
 func defaultGalleryConfig() GalleryConfig {
 	return GalleryConfig{
+		SourceType:      "captureone",
 		GalleryTitle:    "New Gallery",
 		BackgroundColor: "#0a0a0a",
 		CardColor:       "#1a1a1a",
@@ -398,7 +411,216 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin?pw_changed=1", http.StatusSeeOther)
 }
 
-// --- Capture One API ---
+// --- Nextcloud API ---
+
+// WebDAV Multistatus XML structures
+type davMultistatus struct {
+	XMLName   xml.Name      `xml:"multistatus"`
+	Responses []davResponse `xml:"response"`
+}
+
+type davResponse struct {
+	Href     string        `xml:"href"`
+	Propstat []davPropstat `xml:"propstat"`
+}
+
+type davPropstat struct {
+	Prop   davProp `xml:"prop"`
+	Status string  `xml:"status"`
+}
+
+type davProp struct {
+	ContentType   string `xml:"getcontenttype"`
+	ContentLength int64  `xml:"getcontentlength"`
+	ResourceType  struct {
+		Collection *struct{} `xml:"collection"`
+	} `xml:"resourcetype"`
+	LastModified string `xml:"getlastmodified"`
+}
+
+func nextcloudDAVURL(baseURL, user, folder string) string {
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	davURL := fmt.Sprintf("%s/remote.php/dav/files/%s/", baseURL, user)
+	if folder != "" {
+		folder = strings.TrimPrefix(folder, "/")
+		davURL += folder
+		if !strings.HasSuffix(davURL, "/") {
+			davURL += "/"
+		}
+	}
+	return davURL
+}
+
+func nextcloudPROPFIND(ncURL, user, token, folder string) (*davMultistatus, error) {
+	davURL := nextcloudDAVURL(ncURL, user, folder)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("PROPFIND", davURL, strings.NewReader(`<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:getcontenttype/>
+    <d:getcontentlength/>
+    <d:resourcetype/>
+    <d:getlastmodified/>
+  </d:prop>
+</d:propfind>`))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Depth", "1")
+	req.Header.Set("Content-Type", "application/xml")
+	req.SetBasicAuth(user, token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("webdav request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 207 {
+		return nil, fmt.Errorf("webdav error: status %d", resp.StatusCode)
+	}
+
+	var ms davMultistatus
+	if err := xml.NewDecoder(resp.Body).Decode(&ms); err != nil {
+		return nil, fmt.Errorf("parse webdav response: %w", err)
+	}
+	return &ms, nil
+}
+
+func isImageContentType(ct string) bool {
+	ct = strings.ToLower(ct)
+	return strings.HasPrefix(ct, "image/jpeg") || strings.HasPrefix(ct, "image/png") ||
+		strings.HasPrefix(ct, "image/webp") || strings.HasPrefix(ct, "image/tiff") ||
+		strings.HasPrefix(ct, "image/heic")
+}
+
+func syncFromNextcloud(gallery *Gallery) error {
+	ncURL := gallery.Config.NextcloudURL
+	ncUser := gallery.Config.NextcloudUser
+	ncToken := gallery.Config.NextcloudToken
+	folder := gallery.Config.NextcloudFolder
+
+	// Fall back to global credentials if per-gallery are empty
+	if ncURL == "" {
+		ncURL = appData.Site.NextcloudURL
+	}
+	if ncUser == "" {
+		ncUser = appData.Site.NextcloudUser
+	}
+	if ncToken == "" {
+		ncToken = appData.Site.NextcloudToken
+	}
+
+	if ncURL == "" || ncToken == "" || ncUser == "" {
+		return fmt.Errorf("Nextcloud credentials not configured")
+	}
+
+	ms, err := nextcloudPROPFIND(ncURL, ncUser, ncToken, folder)
+	if err != nil {
+		return err
+	}
+
+	baseURL := strings.TrimSuffix(ncURL, "/")
+	var photos []Photo
+	for _, r := range ms.Responses {
+		// Skip the folder itself (first response is always the folder)
+		if strings.HasSuffix(r.Href, "/") {
+			continue
+		}
+
+		// Check content type from propstat
+		var ct string
+		for _, ps := range r.Propstat {
+			if ps.Prop.ContentType != "" {
+				ct = ps.Prop.ContentType
+			}
+		}
+
+		// Also check by file extension as fallback
+		lowerHref := strings.ToLower(r.Href)
+		isImage := isImageContentType(ct)
+		if !isImage {
+			for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp", ".tiff", ".heic"} {
+				if strings.HasSuffix(lowerHref, ext) {
+					isImage = true
+					break
+				}
+			}
+		}
+		if !isImage {
+			continue
+		}
+
+		// Build WebDAV download URL for the file
+		filePath := r.Href
+		prefix := fmt.Sprintf("/remote.php/dav/files/%s/", ncUser)
+		if idx := strings.Index(filePath, prefix); idx >= 0 {
+			filePath = filePath[idx+len(prefix):]
+		}
+
+		fileURL := fmt.Sprintf("%s/remote.php/dav/files/%s/%s", baseURL, ncUser, filePath)
+
+		displayName := filepath.Base(r.Href)
+
+		photos = append(photos, Photo{
+			UUID:        hex.EncodeToString(sha256.New().Sum([]byte(r.Href))[:8]),
+			DisplayName: displayName,
+			SmallURL:    fileURL,
+			MediumURL:   fileURL,
+			Width:       0,
+			Height:      0,
+		})
+	}
+
+	gallery.Photos = photos
+	// Store the credentials used for this gallery so the proxy can authenticate
+	gallery.Config.NextcloudURL = ncURL
+	gallery.Config.NextcloudUser = ncUser
+	gallery.Config.NextcloudToken = ncToken
+
+	return nil
+}
+
+// listNextcloudFolders lists subfolders at the given path
+func listNextcloudFolders(ncURL, user, token, folder string) ([]string, error) {
+	ms, err := nextcloudPROPFIND(ncURL, user, token, folder)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := fmt.Sprintf("/remote.php/dav/files/%s/", user)
+	var folders []string
+	for i, r := range ms.Responses {
+		if i == 0 {
+			continue // skip the folder itself
+		}
+		if !strings.HasSuffix(r.Href, "/") {
+			continue
+		}
+		// Check if it's a collection
+		isCollection := false
+		for _, ps := range r.Propstat {
+			if ps.Prop.ResourceType.Collection != nil {
+				isCollection = true
+			}
+		}
+		if !isCollection && !strings.HasSuffix(r.Href, "/") {
+			continue
+		}
+
+		path := r.Href
+		if idx := strings.Index(path, prefix); idx >= 0 {
+			path = path[idx+len(prefix):]
+		}
+		path = strings.TrimSuffix(path, "/")
+		if path != "" {
+			folders = append(folders, path)
+		}
+	}
+	return folders, nil
+}
 
 type c1EstablishResponse struct {
 	CloudSession struct {
@@ -636,30 +858,64 @@ func handleAdminNew(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.ParseForm()
-	c1URL := r.FormValue("capture_one_url")
-	if c1URL == "" {
-		http.Error(w, "Capture One URL required", 400)
-		return
+	sourceType := r.FormValue("source_type")
+	if sourceType == "" {
+		sourceType = "captureone"
 	}
 
 	g := Gallery{
 		ID:     generateID(),
 		Config: defaultGalleryConfig(),
 	}
-	g.Config.CaptureOneURL = c1URL
+	g.Config.SourceType = sourceType
 	g.Config.SecretToken = generateToken()
 	g.Config.IsPrivate = r.FormValue("is_private") == "on"
 
-	mu.Lock()
-	appData.Galleries = append(appData.Galleries, g)
-	gPtr := &appData.Galleries[len(appData.Galleries)-1]
-	mu.Unlock()
+	var syncErr error
+	if sourceType == "nextcloud" {
+		ncFolder := r.FormValue("nextcloud_folder")
+		if ncFolder == "" {
+			http.Error(w, "Nextcloud folder is required", 400)
+			return
+		}
+		g.Config.NextcloudFolder = ncFolder
+		// Use the folder name as gallery title
+		g.Config.GalleryTitle = filepath.Base(ncFolder)
+		g.Config.Slug = slugify(g.Config.GalleryTitle)
 
-	if err := syncFromCaptureOne(gPtr); err != nil {
 		mu.Lock()
-		appData.Galleries = appData.Galleries[:len(appData.Galleries)-1]
+		appData.Galleries = append(appData.Galleries, g)
+		gPtr := &appData.Galleries[len(appData.Galleries)-1]
 		mu.Unlock()
-		http.Error(w, "Sync failed: "+err.Error(), 500)
+
+		syncErr = syncFromNextcloud(gPtr)
+	} else {
+		c1URL := r.FormValue("capture_one_url")
+		if c1URL == "" {
+			http.Error(w, "Capture One URL required", 400)
+			return
+		}
+		g.Config.CaptureOneURL = c1URL
+
+		mu.Lock()
+		appData.Galleries = append(appData.Galleries, g)
+		gPtr := &appData.Galleries[len(appData.Galleries)-1]
+		mu.Unlock()
+
+		syncErr = syncFromCaptureOne(gPtr)
+	}
+
+	if syncErr != nil {
+		mu.Lock()
+		// Remove the gallery we just added
+		for i, gg := range appData.Galleries {
+			if gg.ID == g.ID {
+				appData.Galleries = append(appData.Galleries[:i], appData.Galleries[i+1:]...)
+				break
+			}
+		}
+		mu.Unlock()
+		http.Error(w, "Sync failed: "+syncErr.Error(), 500)
 		return
 	}
 
@@ -720,7 +976,9 @@ func handleAdminGallerySave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	g.Config.SourceType = r.FormValue("source_type")
 	g.Config.CaptureOneURL = r.FormValue("capture_one_url")
+	g.Config.NextcloudFolder = r.FormValue("nextcloud_folder")
 	g.Config.GalleryTitle = r.FormValue("gallery_title")
 	g.Config.Subtitle = r.FormValue("subtitle")
 	g.Config.Slug = slugify(r.FormValue("slug"))
@@ -795,7 +1053,14 @@ func handleAdminGallerySync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := syncFromCaptureOne(g); err != nil {
+	var err error
+	if g.Config.SourceType == "nextcloud" {
+		err = syncFromNextcloud(g)
+	} else {
+		err = syncFromCaptureOne(g)
+	}
+
+	if err != nil {
 		mu.Unlock()
 		http.Error(w, "Sync failed: "+err.Error(), 500)
 		return
@@ -843,6 +1108,12 @@ func handleAdminSiteSave(w http.ResponseWriter, r *http.Request) {
 	appData.Site.BgColor = r.FormValue("bg_color")
 	appData.Site.TextColor = r.FormValue("text_color")
 	appData.Site.CardColor = r.FormValue("card_color")
+	appData.Site.NextcloudURL = r.FormValue("nextcloud_url")
+	appData.Site.NextcloudUser = r.FormValue("nextcloud_user")
+	// Only update token if a new one was provided (don't overwrite with empty)
+	if t := r.FormValue("nextcloud_token"); t != "" {
+		appData.Site.NextcloudToken = t
+	}
 	saveData()
 	mu.Unlock()
 
@@ -851,13 +1122,47 @@ func handleAdminSiteSave(w http.ResponseWriter, r *http.Request) {
 
 func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 	imageURL := r.URL.Query().Get("url")
-	if imageURL == "" || !strings.HasPrefix(imageURL, "https://live.captureone.com/") {
+	if imageURL == "" {
+		http.Error(w, "invalid url", 400)
+		return
+	}
+
+	var authHeader string
+	valid := false
+
+	// Check if it's Capture One
+	if strings.HasPrefix(imageURL, "https://live.captureone.com/") {
+		valid = true
+	}
+
+	// Check if it's Nextcloud
+	mu.RLock()
+	for _, g := range appData.Galleries {
+		if g.Config.SourceType == "nextcloud" && strings.HasPrefix(imageURL, g.Config.NextcloudURL) {
+			valid = true
+			authHeader = "Basic " + base64Encode(g.Config.NextcloudUser+":"+g.Config.NextcloudToken)
+			break
+		}
+	}
+	mu.RUnlock()
+
+	if !valid {
 		http.Error(w, "invalid url", 400)
 		return
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(imageURL)
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		http.Error(w, "request failed", 500)
+		return
+	}
+
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "fetch failed", 502)
 		return
@@ -867,6 +1172,10 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	io.Copy(w, resp.Body)
+}
+
+func base64Encode(s string) string {
+	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
 // --- Download & Media ---
@@ -1057,6 +1366,37 @@ func handleMediaServe(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filepath.Join(mediaDir(), filename))
 }
 
+func handleAdminNextcloudFolders(w http.ResponseWriter, r *http.Request) {
+	folder := r.URL.Query().Get("path")
+
+	mu.RLock()
+	ncURL := appData.Site.NextcloudURL
+	ncUser := appData.Site.NextcloudUser
+	ncToken := appData.Site.NextcloudToken
+	mu.RUnlock()
+
+	if ncURL == "" || ncUser == "" || ncToken == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Nextcloud credentials not configured"})
+		return
+	}
+
+	folders, err := listNextcloudFolders(ncURL, ncUser, ncToken, folder)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"folders": folders,
+		"current": folder,
+	})
+}
+
 // --- Templates & Main ---
 
 var (
@@ -1083,6 +1423,9 @@ func main() {
 		"delay": func(i int) string {
 			return fmt.Sprintf("%.2f", float64(i)*0.04)
 		},
+		"urlencode": func(s string) string {
+			return url.QueryEscape(s)
+		},
 	}
 	overviewTmpl = template.Must(template.New("overview").Funcs(funcMap).Parse(overviewHTML))
 	galleryTmpl = template.Must(template.New("gallery").Funcs(funcMap).Parse(galleryHTML))
@@ -1093,8 +1436,14 @@ func main() {
 			}
 			return a / float64(b)
 		},
+		"urlencode": func(s string) string {
+			return url.QueryEscape(s)
+		},
+		"proxyURL": func(rawURL string) htmltpl.URL {
+			return htmltpl.URL("/proxy/image?url=" + url.QueryEscape(rawURL))
+		},
 	}
-	adminOverviewTmpl = htmltpl.Must(htmltpl.New("adminOverview").Parse(adminOverviewHTML))
+	adminOverviewTmpl = htmltpl.Must(htmltpl.New("adminOverview").Funcs(htmlFuncMap).Parse(adminOverviewHTML))
 	adminEditTmpl = htmltpl.Must(htmltpl.New("adminEdit").Funcs(htmlFuncMap).Parse(adminEditHTML))
 	loginTmpl = htmltpl.Must(htmltpl.New("login").Parse(loginHTML))
 
@@ -1116,6 +1465,7 @@ func main() {
 	http.HandleFunc("/admin/gallery/set-song", requireAuth(handleAdminGallerySetSong))
 	http.HandleFunc("/admin/gallery/", requireAuth(handleAdminGallery))
 	http.HandleFunc("/admin/new", requireAuth(handleAdminNew))
+	http.HandleFunc("/admin/nextcloud/folders", requireAuth(handleAdminNextcloudFolders))
 	http.HandleFunc("/admin/media/add", requireAuth(handleAdminMediaAdd))
 	http.HandleFunc("/admin/media/delete", requireAuth(handleAdminMediaDelete))
 	http.HandleFunc("/admin/site/save", requireAuth(handleAdminSiteSave))

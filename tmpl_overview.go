@@ -180,7 +180,7 @@ const overviewHTML = `<!DOCTYPE html>
     <div class="galleries-grid">
       {{range $i, $g := .Galleries}}
       <a class="gallery-card" href="/{{$g.Config.Slug}}" style="animation-delay: {{delay $i}}s">
-        <div class="gallery-card-image" {{if $g.Photos}}style="background-image: url('/proxy/image?url={{(index $g.Photos $g.Config.CoverIndex).MediumURL}}')"{{end}}>
+        <div class="gallery-card-image" {{if $g.Photos}}style="background-image: url('/proxy/image?url={{urlencode (index $g.Photos $g.Config.CoverIndex).MediumURL}}')"{{end}}>
           <span class="gallery-card-count">{{len $g.Photos}} photos</span>
           <div class="gallery-card-info">
             <div class="gallery-card-title">{{$g.Config.GalleryTitle}}</div>
