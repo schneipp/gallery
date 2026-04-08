@@ -93,10 +93,11 @@ const loginHTML = `<!DOCTYPE html>
 <div class="login-card">
   <div class="login-title">Gallery Admin</div>
   <div class="login-subtitle">Sign in to manage your galleries</div>
-  {{if .}}
-  <div class="error">{{.}}</div>
+  {{if .Error}}
+  <div class="error">{{.Error}}</div>
   {{end}}
   <form method="POST" action="/admin/login">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <div class="field">
       <label>Username</label>
       <input type="text" name="username" autocomplete="username" autofocus required>

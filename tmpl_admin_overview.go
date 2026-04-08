@@ -150,7 +150,10 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <h1>Gallery Admin</h1>
   <div class="topbar-right">
     <a href="/" target="_blank">View Site &rarr;</a>
-    <a href="/admin/logout">Logout</a>
+    <form method="POST" action="/admin/logout" style="margin:0">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <button type="submit" style="background:none;border:none;color:#888;cursor:pointer;font-size:14px;font-family:inherit">Logout</button>
+    </form>
   </div>
 </div>
 <div class="container">
@@ -159,6 +162,7 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Site Settings</div>
     <form method="POST" action="/admin/site/save">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="field-row">
         <div class="field">
           <label>Site Title</label>
@@ -227,6 +231,7 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Add Gallery</div>
     <form method="POST" action="/admin/new" id="newGalleryForm">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="field">
         <label>Source Type</label>
         <select name="source_type" id="newSourceType" onchange="toggleNewSourceFields()" style="width:auto;min-width:200px">
@@ -391,6 +396,7 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Media Library</div>
     <form method="POST" action="/admin/media/add">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="add-form">
         <div class="field">
           <label>YouTube URL</label>
@@ -408,6 +414,7 @@ const adminOverviewHTML = `<!DOCTYPE html>
           <div style="font-size:12px;color:#888">{{.Artist}} &middot; {{printf "%.0f" .Duration}}s</div>
         </div>
         <form method="POST" action="/admin/media/delete" style="margin:0" onsubmit="return confirm('Delete this song?')">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
           <input type="hidden" name="song_id" value="{{.ID}}">
           <button type="submit" style="background:none;border:none;color:#e57373;cursor:pointer;font-size:13px">Delete</button>
         </form>
@@ -423,11 +430,18 @@ const adminOverviewHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Account</div>
     <form method="POST" action="/admin/password">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="field-row">
         <div class="field">
           <label>Username</label>
           <input type="text" name="username" value="{{.Auth.Username}}" autocomplete="username">
         </div>
+        <div class="field">
+          <label>Current Password</label>
+          <input type="password" name="current_password" placeholder="Required to confirm" autocomplete="current-password" required>
+        </div>
+      </div>
+      <div class="field-row">
         <div class="field">
           <label>New Password</label>
           <input type="password" name="new_password" placeholder="Leave empty to keep current" autocomplete="new-password">

@@ -2,8 +2,10 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,8 +18,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,12 +125,27 @@ type AppData struct {
 }
 
 var (
-	appData  AppData
-	dataFile string
-	mu       sync.RWMutex
-	sessions = make(map[string]time.Time) // session token -> expiry
-	sessMu   sync.Mutex
+	appData         AppData
+	dataFile        string
+	mu              sync.RWMutex
+	passwordPepper  string
+	loginCSRFSecret string
+	sessions        = make(map[string]sessionState)
+	sessMu          sync.Mutex
+	loginStateMu    sync.Mutex
+	loginAttempts   = make(map[string]loginAttempt)
 )
+
+type sessionState struct {
+	Expiry    time.Time
+	CSRFToken string
+}
+
+type loginAttempt struct {
+	Failures    int
+	LockedUntil time.Time
+	LastAttempt time.Time
+}
 
 // --- Helpers ---
 
@@ -143,22 +162,22 @@ func defaultSiteConfig() SiteConfig {
 
 func defaultGalleryConfig() GalleryConfig {
 	return GalleryConfig{
-		SourceType:      "captureone",
-		GalleryTitle:    "New Gallery",
-		BackgroundColor: "#0a0a0a",
-		CardColor:       "#1a1a1a",
-		TextColor:       "#f0f0f0",
-		AccentColor:     "#c8a97e",
-		FrameStyle:      "none",
-		BorderRadius:    "4px",
-		BorderWidth:     "0px",
-		BorderColor:     "#333333",
-		Shadow:          "0 8px 32px rgba(0,0,0,0.4)",
-		HoverEffect:     "lift",
-		Layout:          "masonry",
-		ColumnGap:       "16px",
-		MaxColumns:      4,
-		ShowFilenames:   false,
+		SourceType:          "captureone",
+		GalleryTitle:        "New Gallery",
+		BackgroundColor:     "#0a0a0a",
+		CardColor:           "#1a1a1a",
+		TextColor:           "#f0f0f0",
+		AccentColor:         "#c8a97e",
+		FrameStyle:          "none",
+		BorderRadius:        "4px",
+		BorderWidth:         "0px",
+		BorderColor:         "#333333",
+		Shadow:              "0 8px 32px rgba(0,0,0,0.4)",
+		HoverEffect:         "lift",
+		Layout:              "masonry",
+		ColumnGap:           "16px",
+		MaxColumns:          4,
+		ShowFilenames:       false,
 		LightboxBg:          "rgba(0,0,0,0.95)",
 		SlideshowTransition: "fade",
 	}
@@ -176,9 +195,77 @@ func generateToken() string {
 	return hex.EncodeToString(b)
 }
 
-func hashPassword(pw string) string {
+func hashPasswordLegacy(pw string) string {
 	h := sha256.Sum256([]byte(pw))
 	return hex.EncodeToString(h[:])
+}
+
+func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
+	hashLen := sha256.Size
+	blocks := (keyLen + hashLen - 1) / hashLen
+	out := make([]byte, 0, blocks*hashLen)
+
+	for block := 1; block <= blocks; block++ {
+		mac := hmac.New(sha256.New, password)
+		mac.Write(salt)
+		mac.Write([]byte{byte(block >> 24), byte(block >> 16), byte(block >> 8), byte(block)})
+		u := mac.Sum(nil)
+		t := slices.Clone(u)
+
+		for i := 1; i < iterations; i++ {
+			mac = hmac.New(sha256.New, password)
+			mac.Write(u)
+			u = mac.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		out = append(out, t...)
+	}
+
+	return out[:keyLen]
+}
+
+func passwordKeyMaterial(password string) []byte {
+	return []byte(password + "\x00" + passwordPepper)
+}
+
+func hashPassword(pw string) string {
+	const iterations = 120000
+	salt := make([]byte, 16)
+	rand.Read(salt)
+	key := pbkdf2SHA256(passwordKeyMaterial(pw), salt, iterations, 32)
+	return fmt.Sprintf("pbkdf2_sha256$%d$%s$%s",
+		iterations,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(key),
+	)
+}
+
+func verifyPassword(password, stored string) (valid bool, needsUpgrade bool) {
+	if strings.HasPrefix(stored, "pbkdf2_sha256$") {
+		parts := strings.Split(stored, "$")
+		if len(parts) != 4 {
+			return false, false
+		}
+		iterations, err := strconv.Atoi(parts[1])
+		if err != nil || iterations < 10000 {
+			return false, false
+		}
+		salt, err := base64.RawStdEncoding.DecodeString(parts[2])
+		if err != nil {
+			return false, false
+		}
+		expected, err := base64.RawStdEncoding.DecodeString(parts[3])
+		if err != nil {
+			return false, false
+		}
+		actual := pbkdf2SHA256(passwordKeyMaterial(password), salt, iterations, len(expected))
+		return subtle.ConstantTimeCompare(actual, expected) == 1, false
+	}
+
+	legacy := hashPasswordLegacy(password)
+	return subtle.ConstantTimeCompare([]byte(legacy), []byte(stored)) == 1, true
 }
 
 func slugify(s string) string {
@@ -192,19 +279,18 @@ func loadData() {
 	raw, err := os.ReadFile(dataFile)
 	if err != nil {
 		appData = AppData{Site: defaultSiteConfig()}
+		bootstrapAdminAuth()
 		return
 	}
 	if err := json.Unmarshal(raw, &appData); err != nil {
 		appData = AppData{Site: defaultSiteConfig()}
+		bootstrapAdminAuth()
 		return
 	}
-	if appData.Site.AccentColor == "" {
-		appData.Site = defaultSiteConfig()
-	}
+	applySiteDefaults(&appData.Site)
 	// Set default auth if not configured
 	if appData.Auth.Username == "" {
-		appData.Auth.Username = "admin"
-		appData.Auth.PasswordHash = hashPassword("admin")
+		bootstrapAdminAuth()
 		saveData()
 	}
 	// Ensure all galleries have secret tokens
@@ -219,6 +305,41 @@ func loadData() {
 		saveData()
 	}
 	migrateOldData()
+}
+
+func bootstrapAdminAuth() {
+	password := randomPassword()
+	appData.Auth.Username = "admin"
+	appData.Auth.PasswordHash = hashPassword(password)
+	log.Printf("Initial admin credentials generated. Username: %s Password: %s", appData.Auth.Username, password)
+}
+
+func randomPassword() string {
+	b := make([]byte, 18)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func applySiteDefaults(site *SiteConfig) {
+	defaults := defaultSiteConfig()
+	if site.SiteTitle == "" {
+		site.SiteTitle = defaults.SiteTitle
+	}
+	if site.SiteSubtitle == "" {
+		site.SiteSubtitle = defaults.SiteSubtitle
+	}
+	if site.AccentColor == "" {
+		site.AccentColor = defaults.AccentColor
+	}
+	if site.BgColor == "" {
+		site.BgColor = defaults.BgColor
+	}
+	if site.TextColor == "" {
+		site.TextColor = defaults.TextColor
+	}
+	if site.CardColor == "" {
+		site.CardColor = defaults.CardColor
+	}
 }
 
 func migrateOldData() {
@@ -303,35 +424,229 @@ func mediaDir() string {
 	return dir
 }
 
+func stablePhotoID(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
+}
+
+func gallerySlugFromForm(r *http.Request) string {
+	slug := slugify(r.FormValue("slug"))
+	if slug != "" {
+		return slug
+	}
+	return slugify(r.FormValue("gallery_title"))
+}
+
+func downloadFilename(p Photo, index int) string {
+	name := filepath.Base(strings.TrimSpace(p.DisplayName))
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = filepath.Base(strings.TrimSpace(p.MediumURL))
+	}
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = fmt.Sprintf("photo-%d.jpg", index+1)
+	}
+	if filepath.Ext(name) == "" {
+		name += filepath.Ext(strings.TrimSpace(p.MediumURL))
+	}
+	if filepath.Ext(name) == "" {
+		name += ".jpg"
+	}
+	return name
+}
+
+func authorizedRemoteRequest(method, rawURL string) (*http.Request, error) {
+	req, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return nil, fmt.Errorf("invalid url")
+	}
+	if strings.EqualFold(u.Host, "live.captureone.com") {
+		return req, nil
+	}
+
+	mu.RLock()
+	defer mu.RUnlock()
+	for _, g := range appData.Galleries {
+		if g.Config.SourceType != "nextcloud" || g.Config.NextcloudURL == "" || g.Config.NextcloudUser == "" || g.Config.NextcloudToken == "" {
+			continue
+		}
+
+		base, err := url.Parse(g.Config.NextcloudURL)
+		if err != nil {
+			continue
+		}
+		if !strings.EqualFold(u.Scheme, base.Scheme) || !strings.EqualFold(u.Host, base.Host) {
+			continue
+		}
+
+		basePath := strings.TrimSuffix(base.EscapedPath(), "/")
+		expectedPrefix := path.Clean(basePath + "/remote.php/dav/files/" + g.Config.NextcloudUser + "/")
+		requestPath := path.Clean(u.EscapedPath())
+		if !strings.HasPrefix(requestPath+"/", expectedPrefix+"/") {
+			continue
+		}
+
+		req.Header.Set("Authorization", "Basic "+base64Encode(g.Config.NextcloudUser+":"+g.Config.NextcloudToken))
+		return req, nil
+	}
+
+	return nil, fmt.Errorf("invalid url")
+}
+
+func shouldUseSecureCookies(r *http.Request) bool {
+	if os.Getenv("GALLERY_DEV_MODE") == "1" {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func getSession(r *http.Request) (string, sessionState, bool) {
+	cookie, err := r.Cookie("gallery_session")
+	if err != nil {
+		return "", sessionState{}, false
+	}
+	sessMu.Lock()
+	defer sessMu.Unlock()
+	session, ok := sessions[cookie.Value]
+	if !ok || time.Now().After(session.Expiry) {
+		delete(sessions, cookie.Value)
+		return "", sessionState{}, false
+	}
+	return cookie.Value, session, true
+}
+
+func issueCSRFCookie(w http.ResponseWriter, r *http.Request) string {
+	token := generateToken()
+	setCSRFCookie(w, r, token)
+	return token
+}
+
+func setCSRFCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "gallery_login_csrf",
+		Value:    token,
+		Path:     "/admin/login",
+		HttpOnly: true,
+		Secure:   shouldUseSecureCookies(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   3600,
+	})
+}
+
+func loginCSRFToken(r *http.Request) string {
+	cookie, err := r.Cookie("gallery_login_csrf")
+	if err != nil {
+		return ""
+	}
+	return cookie.Value
+}
+
+func loginCSRFValue(token string) string {
+	mac := hmac.New(sha256.New, []byte(loginCSRFSecret))
+	mac.Write([]byte(token))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func validLoginCSRF(r *http.Request) bool {
+	cookieToken := loginCSRFToken(r)
+	formToken := r.FormValue("csrf_token")
+	if cookieToken == "" || formToken == "" {
+		return false
+	}
+	expected := loginCSRFValue(cookieToken)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(formToken)) == 1
+}
+
+func loginThrottleKey(r *http.Request, username string) string {
+	ip := r.RemoteAddr
+	if host, _, ok := strings.Cut(r.RemoteAddr, ":"); ok {
+		ip = host
+	}
+	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
+		ip = forwarded
+	}
+	return strings.ToLower(strings.TrimSpace(username)) + "|" + ip
+}
+
+func canAttemptLogin(r *http.Request, username string) (bool, time.Duration) {
+	loginStateMu.Lock()
+	defer loginStateMu.Unlock()
+	key := loginThrottleKey(r, username)
+	attempt := loginAttempts[key]
+	now := time.Now()
+	if !attempt.LockedUntil.IsZero() && now.Before(attempt.LockedUntil) {
+		return false, time.Until(attempt.LockedUntil)
+	}
+	if !attempt.LastAttempt.IsZero() && now.Sub(attempt.LastAttempt) > 30*time.Minute {
+		delete(loginAttempts, key)
+	}
+	return true, 0
+}
+
+func recordLoginFailure(r *http.Request, username string) {
+	loginStateMu.Lock()
+	defer loginStateMu.Unlock()
+	key := loginThrottleKey(r, username)
+	attempt := loginAttempts[key]
+	attempt.Failures++
+	attempt.LastAttempt = time.Now()
+	if attempt.Failures >= 5 {
+		attempt.LockedUntil = attempt.LastAttempt.Add(15 * time.Minute)
+		attempt.Failures = 0
+	}
+	loginAttempts[key] = attempt
+}
+
+func clearLoginFailures(r *http.Request, username string) {
+	loginStateMu.Lock()
+	delete(loginAttempts, loginThrottleKey(r, username))
+	loginStateMu.Unlock()
+}
+
+func requestScheme(r *http.Request) string {
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") || r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
 // --- Auth ---
 
 func createSession() string {
 	token := generateToken()
 	sessMu.Lock()
-	sessions[token] = time.Now().Add(24 * time.Hour)
+	sessions[token] = sessionState{
+		Expiry:    time.Now().Add(24 * time.Hour),
+		CSRFToken: generateToken(),
+	}
 	sessMu.Unlock()
 	return token
 }
 
 func isAuthenticated(r *http.Request) bool {
-	cookie, err := r.Cookie("gallery_session")
-	if err != nil {
-		return false
-	}
-	sessMu.Lock()
-	expiry, ok := sessions[cookie.Value]
-	sessMu.Unlock()
-	if !ok || time.Now().After(expiry) {
-		return false
-	}
-	return true
+	_, _, ok := getSession(r)
+	return ok
 }
 
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !isAuthenticated(r) {
+		_, session, ok := getSession(r)
+		if !ok {
 			http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 			return
+		}
+		if r.Method == http.MethodPost {
+			if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf_token")), []byte(session.CSRFToken)) != 1 {
+				http.Error(w, "invalid csrf token", http.StatusForbidden)
+				return
+			}
 		}
 		next(w, r)
 	}
@@ -340,26 +655,62 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		errMsg := ""
-		if r.URL.Query().Get("error") == "1" {
-			errMsg = "Invalid username or password"
+		if code := r.URL.Query().Get("error"); code != "" {
+			switch code {
+			case "1":
+				errMsg = "Invalid username or password"
+			case "throttled":
+				errMsg = "Too many failed attempts. Try again later."
+			default:
+				errMsg = "Unable to sign in"
+			}
 		}
-		loginTmpl.Execute(w, errMsg)
+		token := loginCSRFToken(r)
+		if token == "" {
+			token = issueCSRFCookie(w, r)
+		} else {
+			setCSRFCookie(w, r, token)
+		}
+		loginTmpl.Execute(w, struct {
+			Error     string
+			CSRFToken string
+		}{
+			Error:     errMsg,
+			CSRFToken: loginCSRFValue(token),
+		})
 		return
 	}
 
 	r.ParseForm()
+	if !validLoginCSRF(r) {
+		http.Error(w, "invalid csrf token", http.StatusForbidden)
+		return
+	}
+
 	username := r.FormValue("username")
 	password := r.FormValue("password")
+	if ok, _ := canAttemptLogin(r, username); !ok {
+		http.Redirect(w, r, "/admin/login?error=throttled", http.StatusSeeOther)
+		return
+	}
 
-	mu.RLock()
+	mu.Lock()
 	validUser := appData.Auth.Username
 	validHash := appData.Auth.PasswordHash
-	mu.RUnlock()
+	validPassword, needsUpgrade := verifyPassword(password, validHash)
+	if username == validUser && validPassword && needsUpgrade {
+		appData.Auth.PasswordHash = hashPassword(password)
+		saveData()
+		validHash = appData.Auth.PasswordHash
+	}
+	mu.Unlock()
 
-	if username != validUser || hashPassword(password) != validHash {
+	if username != validUser || !validPassword {
+		recordLoginFailure(r, username)
 		http.Redirect(w, r, "/admin/login?error=1", http.StatusSeeOther)
 		return
 	}
+	clearLoginFailures(r, username)
 
 	token := createSession()
 	http.SetCookie(w, &http.Cookie{
@@ -367,13 +718,27 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   shouldUseSecureCookies(r),
 		MaxAge:   86400,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "gallery_login_csrf",
+		Value:    "",
+		Path:     "/admin/login",
+		HttpOnly: true,
+		Secure:   shouldUseSecureCookies(r),
+		MaxAge:   -1,
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	cookie, err := r.Cookie("gallery_session")
 	if err == nil {
 		sessMu.Lock()
@@ -381,10 +746,13 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		sessMu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:   "gallery_session",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     "gallery_session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   shouldUseSecureCookies(r),
+		SameSite: http.SameSiteStrictMode,
 	})
 	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 }
@@ -397,8 +765,14 @@ func handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 
 	mu.Lock()
+	currentPass := r.FormValue("current_password")
 	newUser := r.FormValue("username")
 	newPass := r.FormValue("new_password")
+	if ok, _ := verifyPassword(currentPass, appData.Auth.PasswordHash); !ok {
+		mu.Unlock()
+		http.Error(w, "current password is incorrect", http.StatusForbidden)
+		return
+	}
 	if newUser != "" {
 		appData.Auth.Username = newUser
 	}
@@ -565,7 +939,7 @@ func syncFromNextcloud(gallery *Gallery) error {
 		displayName := filepath.Base(r.Href)
 
 		photos = append(photos, Photo{
-			UUID:        hex.EncodeToString(sha256.New().Sum([]byte(r.Href))[:8]),
+			UUID:        stablePhotoID(r.Href),
 			DisplayName: displayName,
 			SmallURL:    fileURL,
 			MediumURL:   fileURL,
@@ -843,11 +1217,14 @@ func handleOverview(w http.ResponseWriter, r *http.Request) {
 // --- Admin Handlers ---
 
 func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	_, session, _ := getSession(r)
 	mu.RLock()
 	d := struct {
 		AppData
-		Host string
-	}{appData, r.Host}
+		Host      string
+		Scheme    string
+		CSRFToken string
+	}{appData, r.Host, requestScheme(r), session.CSRFToken}
 	mu.RUnlock()
 	adminOverviewTmpl.Execute(w, d)
 }
@@ -929,9 +1306,11 @@ func handleAdminNew(w http.ResponseWriter, r *http.Request) {
 type adminEditData struct {
 	Gallery
 	Host          string
+	Scheme        string
 	Songs         []Song
 	SelectedSongs []Song
 	TotalDuration float64
+	CSRFToken     string
 }
 
 func handleAdminGallery(w http.ResponseWriter, r *http.Request) {
@@ -955,7 +1334,8 @@ func handleAdminGallery(w http.ResponseWriter, r *http.Request) {
 			totalDur += s.Duration
 		}
 	}
-	d := adminEditData{*g, r.Host, appData.Songs, selected, totalDur}
+	_, session, _ := getSession(r)
+	d := adminEditData{Gallery: *g, Host: r.Host, Scheme: requestScheme(r), Songs: appData.Songs, SelectedSongs: selected, TotalDuration: totalDur, CSRFToken: session.CSRFToken}
 	mu.RUnlock()
 	adminEditTmpl.Execute(w, d)
 }
@@ -981,7 +1361,7 @@ func handleAdminGallerySave(w http.ResponseWriter, r *http.Request) {
 	g.Config.NextcloudFolder = r.FormValue("nextcloud_folder")
 	g.Config.GalleryTitle = r.FormValue("gallery_title")
 	g.Config.Subtitle = r.FormValue("subtitle")
-	g.Config.Slug = slugify(r.FormValue("slug"))
+	g.Config.Slug = gallerySlugFromForm(r)
 	g.Config.IsPrivate = r.FormValue("is_private") == "on"
 	g.Config.FrameStyle = r.FormValue("frame_style")
 	g.Config.BackgroundColor = r.FormValue("background_color")
@@ -1127,47 +1507,23 @@ func handleImageProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var authHeader string
-	valid := false
-
-	// Check if it's Capture One
-	if strings.HasPrefix(imageURL, "https://live.captureone.com/") {
-		valid = true
-	}
-
-	// Check if it's Nextcloud
-	mu.RLock()
-	for _, g := range appData.Galleries {
-		if g.Config.SourceType == "nextcloud" && strings.HasPrefix(imageURL, g.Config.NextcloudURL) {
-			valid = true
-			authHeader = "Basic " + base64Encode(g.Config.NextcloudUser+":"+g.Config.NextcloudToken)
-			break
-		}
-	}
-	mu.RUnlock()
-
-	if !valid {
+	req, err := authorizedRemoteRequest(http.MethodGet, imageURL)
+	if err != nil {
 		http.Error(w, "invalid url", 400)
 		return
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", imageURL, nil)
-	if err != nil {
-		http.Error(w, "request failed", 500)
-		return
-	}
-
-	if authHeader != "" {
-		req.Header.Set("Authorization", authHeader)
-	}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "fetch failed", 502)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "fetch failed", 502)
+		return
+	}
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -1211,13 +1567,20 @@ func handleDownloadGallery(w http.ResponseWriter, r *http.Request) {
 	defer zw.Close()
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	for _, p := range photos {
-		resp, err := client.Get(p.MediumURL)
+	for i, p := range photos {
+		req, err := authorizedRemoteRequest(http.MethodGet, p.MediumURL)
 		if err != nil {
 			continue
 		}
-		ext := ".jpg"
-		fw, err := zw.Create(p.DisplayName + ext)
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		fw, err := zw.Create(downloadFilename(p, i))
 		if err != nil {
 			resp.Body.Close()
 			continue
@@ -1316,6 +1679,13 @@ func handleAdminMediaDelete(w http.ResponseWriter, r *http.Request) {
 				if appData.Galleries[j].SongID == id {
 					appData.Galleries[j].SongID = ""
 				}
+				var filtered []string
+				for _, songID := range appData.Galleries[j].SongIDs {
+					if songID != id {
+						filtered = append(filtered, songID)
+					}
+				}
+				appData.Galleries[j].SongIDs = filtered
 			}
 			break
 		}
@@ -1410,6 +1780,8 @@ var (
 func main() {
 	dir, _ := os.Getwd()
 	dataFile = filepath.Join(dir, "gallery_data.json")
+	passwordPepper = envOrRandom("GALLERY_PASSWORD_PEPPER")
+	loginCSRFSecret = envOrRandom("GALLERY_LOGIN_CSRF_SECRET")
 	loadData()
 
 	funcMap := template.FuncMap{
@@ -1455,7 +1827,7 @@ func main() {
 
 	// Auth routes
 	http.HandleFunc("/admin/login", handleLogin)
-	http.HandleFunc("/admin/logout", handleLogout)
+	http.HandleFunc("/admin/logout", requireAuth(handleLogout))
 
 	// Protected admin routes
 	http.HandleFunc("/admin/gallery/save", requireAuth(handleAdminGallerySave))
@@ -1474,6 +1846,15 @@ func main() {
 
 	log.Println("Gallery running on http://localhost:8082")
 	log.Println("Admin panel: http://localhost:8082/admin")
-	log.Println("Default login: admin / admin")
+	if os.Getenv("GALLERY_DEV_MODE") == "1" {
+		log.Println("Dev mode enabled: secure cookies are relaxed for local HTTP")
+	}
 	log.Fatal(http.ListenAndServe("0.0.0.0:8082", nil))
+}
+
+func envOrRandom(name string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return generateToken()
 }

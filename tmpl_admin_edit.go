@@ -129,6 +129,7 @@ const adminEditHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Source</div>
     <form method="POST" action="/admin/gallery/sync">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="gallery_id" value="{{.ID}}">
       <div class="field">
         <label>Source Type</label>
@@ -179,6 +180,7 @@ const adminEditHTML = `<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Slideshow</div>
     <form method="POST" action="/admin/gallery/set-song" id="songForm">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="gallery_id" value="{{.ID}}">
       <div id="songList">
         {{if .SelectedSongs}}
@@ -240,9 +242,10 @@ const adminEditHTML = `<!DOCTYPE html>
     </p>
     <div style="font-size:13px;color:#999;margin-bottom:6px">Secret access link (always works, even for public galleries):</div>
     <div class="secret-link-box">
-      <input type="text" id="secretLink" value="http://{{.Host}}/s/{{.Config.SecretToken}}" readonly>
+      <input type="text" id="secretLink" value="{{.Scheme}}://{{.Host}}/s/{{.Config.SecretToken}}" readonly>
       <button type="button" class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('secretLink').value);this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
       <form method="POST" action="/admin/gallery/regen-token" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
         <input type="hidden" name="gallery_id" value="{{.ID}}">
         <button type="submit" class="regen-btn" onclick="return confirm('Regenerate token? The old link will stop working.')">Regenerate</button>
       </form>
@@ -251,6 +254,7 @@ const adminEditHTML = `<!DOCTYPE html>
 
   <!-- Config Form -->
   <form method="POST" action="/admin/gallery/save">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <input type="hidden" name="gallery_id" value="{{.ID}}">
     <input type="hidden" name="capture_one_url" value="{{.Config.CaptureOneURL}}">
 
@@ -436,6 +440,7 @@ const adminEditHTML = `<!DOCTYPE html>
     <div class="section-title">Danger Zone</div>
     <p style="font-size:14px;color:#999;margin-bottom:16px">Permanently delete this gallery and all its photos.</p>
     <form method="POST" action="/admin/gallery/delete" onsubmit="return confirm('Delete this gallery? This cannot be undone.')">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="gallery_id" value="{{.ID}}">
       <button type="submit" class="btn btn-danger">Delete Gallery</button>
     </form>
